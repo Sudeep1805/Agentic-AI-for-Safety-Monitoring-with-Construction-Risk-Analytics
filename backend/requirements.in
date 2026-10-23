@@ -1,0 +1,13 @@
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+SQLAlchemy>=2.0,<2.1
+PyMySQL[rsa]>=1.1,<2
+pydantic-settings>=2.8,<3
+email-validator>=2.2,<3
+python-multipart>=0.0.20,<1
+Pillow>=11.1,<13
+# Test tools are included in this learning project's single reproducible environment.
+pytest>=8.3,<10
+httpx>=0.28,<1
+ultralytics>=8.4,<9
+

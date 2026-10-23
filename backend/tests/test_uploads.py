@@ -1,0 +1,326 @@
+
+import asyncio
+import hashlib
+from io import BytesIO
+from pathlib import Path
+from uuid import UUID
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+from PIL import Image
+from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.main import create_app
+from app.models.upload import SiteUpload
+from app.api.auth import current_user
+from app.models.user import User
+
+
+def image_bytes(fmt="PNG", size=(32, 24)):
+    output = BytesIO()
+    Image.new("RGB", size, color=(90, 110, 80)).save(output, format=fmt)
+    return output.getvalue()
+
+
+@pytest.mark.parametrize(
+    "fmt,name,mime",
+    [
+        ("JPEG", "site.jpg", "image/jpeg"),
+        ("PNG", "site.png", "image/png"),
+        ("WEBP", "site.webp", "image/webp"),
+    ],
+)
+def test_save_round_trip(client, settings, session_factory, fmt, name, mime):
+    data = image_bytes(fmt)
+    response = client.post(
+        "/api/uploads",
+        files={"file": (name, data, mime)},
+        data={"site_context": "  East excavation — user note  "},
+    )
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+
+    UUID(body["id"])
+    assert body["upload_status"] == "saved"
+    assert body["analysis_status"] in ("completed", "unavailable")
+    assert isinstance(body["detections"], list)
+
+    if body["analysis_status"] == "completed":
+        assert "YOLO detection completed" in body["analysis_message"]
+        assert body["risk_score"] == 0
+        assert body["risk_level"] == "Low"
+        assert body["hazard_count"] == 0
+        assert body["hazards"] == []
+        for detection in body["detections"]:
+            assert isinstance(detection["class_id"], int)
+            assert isinstance(detection["class_name"], str)
+            assert 0 <= detection["confidence"] <= 1
+            assert len(detection["bbox"]) == 4
+    else:
+        assert body["detections"] == []
+        assert body["risk_score"] is None
+        assert body["risk_level"] is None
+        assert body["hazards"] == []
+        assert "could not be completed" in body["analysis_message"]
+
+    assert body["created_at"].endswith("Z")
+    assert body["site_context"] == "East excavation — user note"
+    assert (body["width"], body["height"]) == (32, 24)
+    assert body["sha256"] == hashlib.sha256(data).hexdigest()
+
+    with session_factory() as session:
+        row = session.get(SiteUpload, body["id"])
+        assert row.original_filename == name
+        assert row.stored_filename != name
+        assert (settings.storage_path / row.stored_filename).read_bytes() == data
+
+    downloaded = client.get(body["image_url"])
+    assert downloaded.content == data
+    assert downloaded.headers["content-type"] == mime
+    assert downloaded.headers["x-content-type-options"] == "nosniff"
+
+    # List and detail endpoints currently serialize saved metadata only.
+    detail = client.get(f'/api/uploads/{body["id"]}')
+    assert detail.status_code == 200
+    assert detail.json()["id"] == body["id"]
+
+    listing = client.get("/api/uploads")
+    assert listing.status_code == 200
+    assert listing.json()["total"] == 1
+    assert listing.json()["items"][0]["id"] == body["id"]
+
+
+@pytest.mark.parametrize(
+    "name,data,mime,status",
+    [
+        ("fake.jpg", b"not an image", "image/jpeg", 422),
+        ("empty.png", b"", "image/png", 422),
+        ("site.svg", b"<svg/>", "image/svg+xml", 415),
+        ("wrong.jpg", image_bytes(), "image/jpeg", 415),
+        ("wrong.png", image_bytes(), "image/jpeg", 415),
+        ("wrong.png", image_bytes("GIF"), "image/png", 415),
+        ("broken.png", image_bytes()[:45], "image/png", 422),
+        ("broken.jpg", image_bytes("JPEG")[:-25], "image/jpeg", 422),
+    ],
+)
+def test_invalid_images_leave_no_records(
+    client, settings, session_factory, name, data, mime, status
+):
+    response = client.post(
+        "/api/uploads",
+        files={"file": (name, data, mime)},
+    )
+    assert response.status_code == status, response.text
+    assert not list(settings.storage_path.glob("*"))
+
+    with session_factory() as session:
+        assert session.scalar(
+            select(func.count()).select_from(SiteUpload)
+        ) == 0
+
+
+def test_file_size_and_whole_request_limits(client, settings):
+    data = b"x" * (settings.max_upload_bytes + 1)
+
+    assert client.post(
+        "/api/uploads",
+        files={"file": ("big.png", data, "image/png")},
+    ).status_code == 413
+
+    assert client.post(
+        "/api/uploads",
+        content=b"x" * (settings.max_upload_bytes + 70000),
+    ).status_code == 413
+
+
+def test_chunked_body_is_limited(settings, session_factory):
+    async def run():
+        async def chunks():
+            for _ in range(20):
+                yield b"x" * 100000
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=create_app(settings, session_factory)
+            ),
+            base_url="http://test",
+        ) as client:
+            response = await client.post(
+                "/api/uploads",
+                content=chunks(),
+            )
+            assert response.status_code == 413
+
+    asyncio.run(run())
+
+
+def test_pixel_limit(client):
+    response = client.post(
+        "/api/uploads",
+        files={
+            "file": (
+                "large.png",
+                image_bytes(size=(1001, 1000)),
+                "image/png",
+            )
+        },
+    )
+    assert response.status_code == 422
+    assert "pixels" in response.json()["detail"]
+
+
+def test_reject_animation(client):
+    output = BytesIO()
+    Image.new("RGB", (20, 20), "red").save(
+        output,
+        "PNG",
+        save_all=True,
+        append_images=[Image.new("RGB", (20, 20), "blue")],
+    )
+
+    response = client.post(
+        "/api/uploads",
+        files={
+            "file": (
+                "animation.png",
+                output.getvalue(),
+                "image/png",
+            )
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_context_limit_and_missing_file(client):
+    assert client.post(
+        "/api/uploads",
+        files={"file": ("site.png", image_bytes(), "image/png")},
+        data={"site_context": "x" * 2001},
+    ).status_code == 422
+
+    assert client.post(
+        "/api/uploads",
+        data={"site_context": "notes"},
+    ).status_code == 422
+
+
+def test_traversal_name_and_duplicate_names(client, settings):
+    for _ in range(2):
+        response = client.post(
+            "/api/uploads",
+            files={
+                "file": ("../../site.png", image_bytes(), "image/png")
+            },
+        )
+        assert response.status_code == 201
+        assert response.json()["original_filename"] == "site.png"
+
+    files = list(settings.storage_path.iterdir())
+    assert len(files) == 2
+    assert all(
+        path.parent == settings.storage_path and path.name != "site.png"
+        for path in files
+    )
+
+    result = client.get("/api/uploads?limit=1&offset=1").json()
+    assert len(result["items"]) == 1
+    assert result["total"] == 2
+
+
+def test_unknown_records_and_missing_image(client, settings):
+    assert client.get(
+        "/api/uploads/00000000-0000-0000-0000-000000000000"
+    ).status_code == 404
+
+    assert client.get("/api/uploads/not-an-id").status_code == 422
+
+    response = client.post(
+        "/api/uploads",
+        files={"file": ("site.png", image_bytes(), "image/png")},
+    )
+    assert response.status_code == 201
+
+    next(settings.storage_path.iterdir()).unlink()
+
+    assert client.get(response.json()["image_url"]).status_code == 404
+
+
+def test_disk_failure(client, settings, monkeypatch):
+    original = Path.mkdir
+
+    def fail_storage(path, *args, **kwargs):
+        if path == settings.storage_path:
+            raise PermissionError("private filesystem details")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", fail_storage)
+
+    response = client.post(
+        "/api/uploads",
+        files={"file": ("site.png", image_bytes(), "image/png")},
+    )
+    assert response.status_code == 503
+    assert "private" not in response.text
+
+
+def test_database_failure_cleans_file_and_keeps_health_honest(settings):
+    class FailingSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def add(self, record):
+            pass
+
+        def commit(self):
+            raise SQLAlchemyError("SECRET_PASSWORD")
+
+        def rollback(self):
+            pass
+
+        def execute(self, *args):
+            raise SQLAlchemyError("SECRET_PASSWORD")
+
+        def scalars(self, *args):
+            raise SQLAlchemyError("SECRET_PASSWORD")
+
+    app = create_app(settings, FailingSession)
+    app.dependency_overrides[current_user] = lambda: User(
+        id="fixture-user",
+        email="fixture@example.com",
+        full_name="Fixture User",
+        password_hash="unused",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/uploads",
+            files={"file": ("site.png", image_bytes(), "image/png")},
+        )
+        assert response.status_code == 503
+        assert not list(settings.storage_path.glob("*"))
+        assert client.get("/health").status_code == 200
+        assert client.get("/health/ready").status_code == 503
+        assert client.get("/api/uploads").status_code == 503
+        assert "SECRET_PASSWORD" not in response.text
+
+
+def test_health_and_cors(client):
+    assert client.get("/health").json()["status"] == "ok"
+    assert client.get("/health/ready").json()["database"] == "connected"
+
+    response = client.options(
+        "/api/uploads",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert response.headers["access-control-allow-origin"] == (
+        "http://localhost:5173"
+    )

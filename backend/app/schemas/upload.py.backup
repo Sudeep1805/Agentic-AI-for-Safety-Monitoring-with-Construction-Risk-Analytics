@@ -1,0 +1,33 @@
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel
+
+
+ANALYSIS_MESSAGE = (
+    "Analysis unavailable. This foundation saves photographs and site context only. "
+    "A supported vision model and the Site Risk Agent must be implemented and configured "
+    "before hazards or scores can be assessed."
+)
+
+
+class UploadResponse(BaseModel):
+    id: str
+    original_filename: str
+    content_type: str
+    size_bytes: int
+    width: int
+    height: int
+    sha256: str
+    site_context: str | None
+    created_at: datetime
+    image_url: str
+    upload_status: Literal["saved"] = "saved"
+    analysis_status: Literal["unavailable"] = "unavailable"
+    analysis_message: str = ANALYSIS_MESSAGE
+    risk_score: None = None
+
+
+class UploadList(BaseModel):
+    items: list[UploadResponse]
+    total: int
